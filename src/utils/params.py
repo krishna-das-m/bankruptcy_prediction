@@ -1,7 +1,7 @@
 from sklearn.ensemble import RandomForestClassifier
 import xgboost as xgb
 # ===== PARAMETER SPACE DEFINITIONS =====
-# This is the key to flexibility - define all model parameters in dictionaries
+# define all model parameters in dictionaries
 
 PARAM_SPACES = {
     'RandomForest': {
@@ -96,7 +96,7 @@ MODEL_FACTORY = {
 }
 
 # ===== SCORING METRICS =====
-# Available scoring options for cross-validation
+# scoring options for cross-validation
 
 SCORING_METRICS = {
     'accuracy': 'accuracy',

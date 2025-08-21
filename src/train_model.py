@@ -4,6 +4,10 @@ from sklearn.metrics import classification_report, confusion_matrix, roc_auc_sco
 from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
+from sklearn.impute import SimpleImputer
+
+from imblearn.over_sampling import SMOTE
+from imblearn.pipeline import Pipeline
 from utils import params
 import time
 
@@ -20,7 +24,6 @@ SCORING_METRICS = params.SCORING_METRICS # various performance metrics
 def suggest_params_from_config(trial, param_space):
     """
     Convert parameter space dictionary into Optuna trial suggestions.
-    This is the magic function that makes everything flexible!
     """
     suggested_params = {}
     
@@ -50,39 +53,21 @@ def suggest_params_from_config(trial, param_space):
     
     return suggested_params
 
-def get_or_create_experiment(experiment_name):
-    """
-    Retrieve the ID of an existing MLflow experiment or create a new one if it doesn't exist.
-    """
-    if experiment := mlflow.get_experiment_by_name(experiment_name):
-        return experiment.experiment_id
-    else:
-        return mlflow.create_experiment(experiment_name)
-
-exp_id = get_or_create_experiment('bankruptcy_prediction')
-
-# Set the current active MLflow experiment
-mlflow.set_experiment(experiment_id=exp_id)
-
-    
-def performance(actual, pred):
-    f1 = f1_score(actual, pred)
-    accuracy = accuracy_score(actual, pred)
-    precision = precision_score(actual, pred)
-    recall = recall_score(actual, pred)
-
-    return f1, accuracy, precision, recall
-
 def prepare_data(df):
-    train, test = train_test_split(df, test_size=0.2)
-    # create X, y data
-    x_train = train.drop(["class"], axis=1)
-    y_train = train['class']
+    X =  df.drop(['class'], axis=1)
+    y = df['class']
 
-    x_test = test.drop(["class"], axis=1)
-    y_test = test['class']
+    imputer = SimpleImputer(strategy='mean')
+    X_imputed = imputer.fit_transform(X)
 
-    return x_train, y_train, x_test, y_test
+    # standardize the features
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X_imputed)
+    
+    # split the data into training and test set
+    X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2)
+
+    return X_train, y_train, X_test, y_test
 
 
 def create_flexible_objective(X_train, y_train, model_name, scoring_metric='recall', cv_folds=5):
@@ -106,20 +91,34 @@ def create_flexible_objective(X_train, y_train, model_name, scoring_metric='reca
         start_time = time.time()
         
         try:
-            # 1. Get suggested parameters using our flexible function
+            # 1. Get suggested parameters using flexible function
             suggested_params = suggest_params_from_config(trial, param_space)
             
             # 2. Combine with default parameters
-            all_params = {**model_info['default_params'], **suggested_params}
+            all_model_params = {**model_info['default_params'], **suggested_params}
+
+            # 3. smote hyperparameters
+            max_k =  min(10, sum(y_train==1)-1)
+            k_neighbors = trial.suggest_int('k_neighbors', 1, max_k) if max_k >1 else 1
+            sampling_strategy = trial.suggest_float('smote_sampling_strategy', 0.1, 1.0)
+
+            smote = SMOTE(sampling_strategy=sampling_strategy,k_neighbors=k_neighbors, random_state=42)
+    
+            # 4. Create model instance
+            model = model_info['class'](**all_model_params)
+
+            # 5. create a pipeline with smote and the chosen model
+            steps = [('smote', smote), ('model', model)]
+            pipeline = Pipeline(steps=steps)
+            # pipeline.fit(X_train, y_train) # cause data leakage
+            # apply smote to training data
+            # X_train_resampled, y_train_resampled = smote.fit_resample(X_train, y_train)
             
-            # 3. Create model instance
-            model = model_info['class'](**all_params)
-            
-            # 4. Perform cross-validation
-            scores = cross_val_score(model, X_train, y_train, cv=cv_folds, scoring=scoring)
+            # 6. Perform cross-validation
+            scores = cross_val_score(pipeline, X_train, y_train, cv=cv_folds, scoring=scoring)
             mean_score = scores.mean()
             
-            # 5. Log additional metrics for debugging
+            # 7. Log additional metrics for debugging
             trial_time = time.time() - start_time
             trial.set_user_attr("trial_duration", trial_time)
             trial.set_user_attr("cv_std", scores.std())
@@ -190,7 +189,8 @@ def run_optimization(X_train, y_train, model_name='RandomForest', scoring_metric
         
         # Run optimization with progress tracking
         print(f"\n=== Starting {model_name} optimization for {scoring_metric} ===")
-        print(f"Parameters to optimize: {list(PARAM_SPACES[model_name].keys())}")
+        params_to_optimize = list(PARAM_SPACES[model_name].keys()) + ['k_neighbors', 'sampling_strategy']
+        print(f"Parameters to optimize: {params_to_optimize}")
         
         study.optimize(
             objective,
@@ -210,8 +210,21 @@ def run_optimization(X_train, y_train, model_name='RandomForest', scoring_metric
         
         # Create and log best model
         model_info = MODELS[model_name]
-        all_params = {**model_info['default_params'], **best_params}
-        best_model = model_info['class'](**all_params)
+        # model_params = {**model_info['default_params'], **best_params}
+        model_params = {k: v for k, v in best_params.items() 
+                        if not k.startswith(('k_neighbors', 'smote_'))}
+        # smote_params = {k:v for k,v in best_params.items() if k.startswith(('k_neighbors','smote_'))}
+        best_model = model_info['class'](**model_params)
+        # Create SMOTE with best parameters
+        best_smote = SMOTE(
+            sampling_strategy=best_params.get('smote_sampling_strategy', 0.5),
+            k_neighbors=best_params.get('k_neighbors', 5),
+            random_state=42
+        )
+        # best_model.fit(X_train, y_train)
+        # Create final pipeline   
+        steps = [('smote', best_smote), ('model', best_model)]
+        best_model = Pipeline(steps=steps)
         best_model.fit(X_train, y_train)
         
         mlflow.sklearn.log_model(best_model, "best_model")
@@ -222,10 +235,11 @@ def run_optimization(X_train, y_train, model_name='RandomForest', scoring_metric
         
         return best_model, study
 
-def evaluate_model(model, X_test, y_test, model_name):
+def evaluate_model(model, X_test, y_test, model_name, exp_name):
     """
     Comprehensive model evaluation - separate and focused.
     """
+    mlflow.set_experiment(experiment_name=exp_name)
     
     with mlflow.start_run(run_name=f'{model_name}_evaluation'):
         
@@ -253,46 +267,45 @@ def evaluate_model(model, X_test, y_test, model_name):
         
         return metrics
     
-def example_usage():
+def usage():
     """
-    Show how to use the flexible framework for different scenarios
+    Show how to use the framework for different scenarios
     """
     
     # Load your data (replace with actual data loading)
     data = pd.read_csv(r'C:\Users\Admin\Projects\ML Projects\bankruptcy_prediction\data\data.csv')
     X_train, y_train, X_test, y_test = prepare_data(data)  # your existing function
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
     
-    print("=== Flexible Optuna-MLflow Framework Examples ===\n")
+    print("=== Optuna-MLflow Framework ===\n")
     
     # Example 1: RandomForest optimizing for recall
     print("Example 1: RandomForest for recall")
+    exp_name1 = 'bankruptcy_prediction_recall_smote'
     best_model_1, study_1 = run_optimization(
         X_train, y_train, 
         model_name='RandomForest', 
         scoring_metric='recall',
-        n_trials=5,
-        experiment_name='bankruptcy_prediction_recall'
+        n_trials=100,
+        experiment_name=exp_name1
     )
     
     # Example 2: XGBoost optimizing for F1-score  
     print("Example 2: XGBoost for F1-score")
+    exp_name2 = 'bankruptcy_prediction_f1_smote'
     best_model_2, study_2 = run_optimization(
         X_train, y_train,
         model_name='XGBoost',
         scoring_metric='f1', 
-        n_trials=5,
-        experiment_name='bankruptcy_prediction_f1'
+        n_trials=100,
+        experiment_name=exp_name2
     )
     
-    # Example 3: Compare models
-    evaluate_model(best_model_1, X_test, y_test, 'RandomForest')
-    evaluate_model(best_model_2, X_test, y_test, 'XGBoost')
+    # Example 3: Compare models in their respective experiments
+    evaluate_model(best_model_1, X_test, y_test, 'RandomForest', exp_name1)
+    evaluate_model(best_model_2, X_test, y_test, 'XGBoost', exp_name2)
 
 if __name__ == "__main__":
-    example_usage()
+    usage()
 
 # def train_baseline_model(data):
 #     X_train, y_train, x_test, y_test = prepare_data(data)
